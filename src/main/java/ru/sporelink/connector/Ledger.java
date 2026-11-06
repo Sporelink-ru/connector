@@ -209,4 +209,23 @@ public class Ledger {
     public void close() throws SQLException {
         conn.close();
     }
+
+    // ── Recovery: find stuck transactions ──────────────────────────
+    public record StuckTx(String txId, String peerUrl, long createdAt) {}
+
+    public java.util.List<StuckTx> findPreparedOutOlderThan(long seconds) throws SQLException {
+        long cutoff = System.currentTimeMillis() / 1000 - seconds;
+        java.util.List<StuckTx> out = new java.util.ArrayList<>();
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT tx_id, peer_url, created_at FROM transactions "
+            + "WHERE status = 'prepared_out' AND created_at < ?")) {
+            ps.setLong(1, cutoff);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    out.add(new StuckTx(rs.getString(1), rs.getString(2), rs.getLong(3)));
+                }
+            }
+        }
+        return out;
+    }
 }
