@@ -13,7 +13,9 @@ import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.StringJoiner;
 
 public class App {
@@ -48,9 +50,8 @@ public class App {
             System.err.println("✗ manifest has no signatures");
             System.exit(1);
         }
-        JsonNode sigNode = signatures.get(0);
-        String sigB64  = sigNode.get("sig").asText();
-        String signer  = sigNode.get("signer").asText();
+        String sigB64 = signatures.get(0).get("sig").asText();
+        String signer = signatures.get(0).get("signer").asText();
 
         ObjectNode toSign = (ObjectNode) mfJson.deepCopy();
         toSign.remove("signatures");
@@ -69,18 +70,22 @@ public class App {
         System.out.println((manifestOk ? "✓" : "✗") + " Подпись манифеста от " + signer);
         if (!manifestOk) System.exit(1);
 
-        // ── 3. JWT (optional second arg) ───────────────────────────
+        // ── 3. Extract members → key map by server_id ──────────────
+        Map<String, byte[]> keyByServerId = new HashMap<>();
+        JsonNode members = mfJson.get("members");
+        if (members != null && members.isArray()) {
+            for (JsonNode m : members) {
+                String id = m.get("server_id").asText();
+                String pk = m.get("public_key").asText().replace("ed25519:", "");
+                keyByServerId.put(id, Base64.getDecoder().decode(pk));
+            }
+        }
+        System.out.println("  members: " + keyByServerId.keySet());
+
+        // ── 4. JWT (optional second arg) ───────────────────────────
         if (args.length > 1) {
             String jwt = args[1];
-
-            String authKeyB64 = wkJson.at("/public_keys/auth_signing_key").asText(null);
-            if (authKeyB64 == null || authKeyB64.isEmpty()) {
-                authKeyB64 = wkJson.at("/public_keys/server_signing_key").asText();
-            }
-            authKeyB64 = authKeyB64.replace("ed25519:", "");
-            byte[] authPubKey = Base64.getDecoder().decode(authKeyB64);
-
-            boolean jwtOk = verifyJwt(jwt, authPubKey);
+            boolean jwtOk = verifyJwt(jwt, keyByServerId);
             System.out.println((jwtOk ? "✓" : "✗") + " JWT valid");
 
             if (jwtOk) {
@@ -97,43 +102,57 @@ public class App {
         }
     }
 
-    // ── JWT verification (no network call to hub) ──────────────────
-    static boolean verifyJwt(String jwt, byte[] hubPublicKey) throws Exception {
+    // ── JWT verification (multi-hub aware) ─────────────────────────
+    static boolean verifyJwt(String jwt, Map<String, byte[]> keyByServerId) throws Exception {
         String[] parts = jwt.split("\\.");
         if (parts.length != 3) return false;
 
-        // 1. Signature over raw signing input — no canonicalization
+        // 1. Read kid from header
+        JsonNode header = MAPPER.readTree(Base64.getUrlDecoder().decode(parts[0]));
+        JsonNode kidNode = header.get("kid");
+        if (kidNode == null || kidNode.isNull()) {
+            System.out.println("  header has no kid");
+            return false;
+        }
+        String kid = kidNode.asText();
+
+        // 2. Lookup key by kid
+        byte[] key = keyByServerId.get(kid);
+        if (key == null) {
+            System.out.println("  unknown kid: " + kid
+                    + " (known: " + keyByServerId.keySet() + ")");
+            return false;
+        }
+
+        // 3. Verify signature over raw signing input
         String signingInput = parts[0] + "." + parts[1];
         byte[] sig = Base64.getUrlDecoder().decode(parts[2]);
 
-        Ed25519PublicKeyParameters pub = new Ed25519PublicKeyParameters(hubPublicKey, 0);
+        Ed25519PublicKeyParameters pub = new Ed25519PublicKeyParameters(key, 0);
         Ed25519Signer verifier = new Ed25519Signer();
         verifier.init(false, pub);
         byte[] input = signingInput.getBytes(StandardCharsets.UTF_8);
         verifier.update(input, 0, input.length);
         if (!verifier.verifySignature(sig)) return false;
 
-        // 2. exp check
-        byte[] payloadBytes = Base64.getUrlDecoder().decode(parts[1]);
-        JsonNode payload = MAPPER.readTree(payloadBytes);
+        // 4. Verify exp
+        JsonNode payload = MAPPER.readTree(Base64.getUrlDecoder().decode(parts[1]));
         long exp = payload.get("exp").asLong();
         if (exp < System.currentTimeMillis() / 1000) return false;
 
-        // 3. iss check — compare with server_id from well-known
-        //    (passed in real callers; skipped here for MVP)
-        // String expectedIss = wkJson.get("server_id").asText();
-        // if (!expectedIss.equals(payload.get("iss").asText())) return false;
+        // 5. Verify iss == kid (defence in depth)
+        String iss = payload.get("iss").asText();
+        if (!iss.equals(kid)) return false;
 
         return true;
     }
 
     // ── Recursive canonicalization (JCS-like) ──────────────────────
-    // Must match the C# Canonicalize() in hub/Program.cs.
     static String canonicalize(JsonNode node) throws Exception {
         if (node.isObject()) {
             List<String> keys = new ArrayList<>();
             node.fieldNames().forEachRemaining(keys::add);
-            keys.sort(String::compareTo); // UTF-16 code unit ordering
+            keys.sort(String::compareTo);
 
             StringJoiner sj = new StringJoiner(",", "{", "}");
             for (String k : keys) {
@@ -152,7 +171,6 @@ public class App {
         }
     }
 
-    // ── HTTP helper ────────────────────────────────────────────────
     static String get(HttpClient c, String url) throws Exception {
         HttpResponse<String> resp = c.send(
                 HttpRequest.newBuilder(URI.create(url)).GET().build(),
