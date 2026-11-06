@@ -1,0 +1,10 @@
+target/
+*.class
+*.jar
+!.mvn/wrapper/maven-wrapper.jar
+.mvn/timing.properties
+dependency-reduced-pom.xml
+*.log
+.env
+.env.*
+!.env.example
