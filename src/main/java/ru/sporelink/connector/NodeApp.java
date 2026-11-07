@@ -213,6 +213,7 @@ public class NodeApp {
         server.createContext("/transfer", ex -> {
             if (!isPost(ex)) { respond(ex, 405, "{\"error\":\"POST only\"}"); return; }
             try {
+                // 1. Парсим тело запроса
                 JsonNode b = MAPPER.readTree(ex.getRequestBody());
                 String toNode = b.get("to_node").asText().replaceAll("/+$", "");
                 String from   = b.get("from").asText();
@@ -220,6 +221,17 @@ public class NodeApp {
                 long   amount = b.get("amount").asLong();
                 String txId   = UUID.randomUUID().toString();
 
+                // 2. НОВЫЙ БЛОК: Локальный перевод (если оба игрока на этой ноде)
+                if (toNode.equals(selfUrl)) {
+                    if (ledger.localTransfer(from, to, amount)) {
+                        respond(ex, 200, "{\"status\":\"committed\",\"tx_id\":\"" + txId + "\"}");
+                    } else {
+                        respond(ex, 400, "{\"error\":\"insufficient balance\",\"tx_id\":\"" + txId + "\"}");
+                    }
+                    return;
+                }
+
+                // 3. Сетевой 2PC (если получатель на другой ноде)
                 if (!ledger.prepareOut(txId, from, amount, toNode)) {
                     respond(ex, 400, "{\"error\":\"insufficient balance\",\"tx_id\":\"" + txId + "\"}");
                     return;
@@ -267,7 +279,9 @@ public class NodeApp {
                 }
                 ledger.commitOut(txId);
                 respond(ex, 200, "{\"status\":\"committed\",\"tx_id\":\"" + txId + "\"}");
-            } catch (Exception e) { respond(ex, 500, err(e)); }
+            } catch (Exception e) { 
+                respond(ex, 500, err(e)); 
+            }
         });
 
         server.start();

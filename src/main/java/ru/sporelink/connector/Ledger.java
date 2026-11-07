@@ -235,4 +235,36 @@ public class Ledger {
         }
         return out;
     }
+
+    // ── Local transfer (when both players are on the same node) ─────
+    public boolean localTransfer(String from, String to, long amount) throws SQLException {
+        conn.setAutoCommit(false);
+        try {
+            long bal = balance(from);
+            if (bal < amount) {
+                conn.rollback();
+                conn.setAutoCommit(true);
+                return false;
+            }
+            
+            // Списание
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "UPDATE accounts SET balance = balance - ? WHERE player_id = ?")) {
+                ps.setLong(1, amount);
+                ps.setString(2, from);
+                ps.executeUpdate();
+            }
+            
+            // Начисление
+            credit(to, amount);
+            
+            conn.commit();
+            return true;
+        } catch (SQLException e) {
+            conn.rollback();
+            throw e;
+        } finally {
+            conn.setAutoCommit(true);
+        }
+    }
 }
