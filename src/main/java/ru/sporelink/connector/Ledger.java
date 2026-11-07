@@ -6,7 +6,14 @@ public class Ledger {
     private final Connection conn;
 
     public Ledger(String path) throws SQLException {
+        try {
+            java.nio.file.Path p = java.nio.file.Path.of(path);
+            if (p.getParent() != null) java.nio.file.Files.createDirectories(p.getParent());
+        } catch (Exception e) {
+            System.err.println("Failed to create db directory: " + e.getMessage());
+        }
         conn = DriverManager.getConnection("jdbc:sqlite:" + path);
+
         try (Statement st = conn.createStatement()) {
             st.execute("""
                 CREATE TABLE IF NOT EXISTS accounts (

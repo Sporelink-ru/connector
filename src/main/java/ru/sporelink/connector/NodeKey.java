@@ -27,6 +27,12 @@ public class NodeKey {
             Ed25519PrivateKeyParameters priv = new Ed25519PrivateKeyParameters(raw, 0);
             return new NodeKey(priv, priv.generatePublicKey());
         }
+        
+        // Создаем родительскую директорию, если её нет!
+        if (p.getParent() != null) {
+            Files.createDirectories(p.getParent());
+        }
+
         Ed25519KeyPairGenerator gen = new Ed25519KeyPairGenerator();
         gen.init(new Ed25519KeyGenerationParameters(new SecureRandom()));
         AsymmetricCipherKeyPair kp = gen.generateKeyPair();
@@ -37,7 +43,7 @@ public class NodeKey {
         System.out.println("✓ Generated node key at " + p);
         return k;
     }
-
+    
     public Ed25519PrivateKeyParameters privateKey() { return priv; }
     public Ed25519PublicKeyParameters publicKey()   { return pub; }
     public String publicKeyBase64() {
