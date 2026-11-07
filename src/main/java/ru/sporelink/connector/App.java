@@ -96,6 +96,16 @@ public class App {
                 System.out.println("  name: " + payload.get("name").asText());
                 System.out.println("  exp:  " + payload.get("exp").asLong());
                 System.out.println("  iss:  " + payload.get("iss").asText());
+                
+                if (payload.has("reputation")) {
+                    System.out.println("  rep:  " + payload.get("reputation").asInt());
+                }
+                if (payload.has("roles")) {
+                    System.out.println("  roles: " + payload.get("roles"));
+                }
+                if (payload.has("federation")) {
+                    System.out.println("  fed:  " + payload.get("federation").asText());
+                }
             } else {
                 System.exit(1);
             }
