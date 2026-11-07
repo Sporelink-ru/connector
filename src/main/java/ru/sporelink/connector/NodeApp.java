@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 import org.bouncycastle.crypto.params.Ed25519PublicKeyParameters;
+import org.bouncycastle.crypto.signers.Ed25519Signer;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
@@ -25,26 +26,31 @@ public class NodeApp {
     private static final HttpClient HTTP = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(3))
             .build();
-    private static final long TS_WINDOW = 300;
+    private static final long TS_WINDOW = 300; // 5 minutes
     private static final Map<String, Ed25519PublicKeyParameters> PEER_KEYS = new HashMap<>();
 
+    // Политика ноды по умолчанию
+    private static int minReputationToJoin = 0;
+
     public static void main(String[] args) throws Exception {
-        if (args.length < 3) {
-            System.err.println("usage: NodeApp <port> <data-dir> <node-id>");
+        if (args.length < 4) {
+            System.err.println("usage: NodeApp <port> <data-dir> <node-id> <hub-url>");
             System.exit(2);
         }
         int port = Integer.parseInt(args[0]);
         String dataDir = args[1];
         String nodeId = args[2];
+        String hubUrl = args[3].replaceAll("/+$", "");
         String selfUrl = "http://localhost:" + port;
 
         NodeKey key = NodeKey.loadOrCreate(dataDir + "/node-key.txt");
         Ledger ledger = new Ledger(dataDir + "/ledger.db");
 
         System.out.println("Node ID:  " + nodeId);
+        System.out.println("Hub URL:  " + hubUrl);
         System.out.println("Pubkey:   ed25519:" + key.publicKeyBase64());
 
-        // Recovery loop
+        // ── Recovery loop ──────────────────────────────────────────
         Executors.newSingleThreadScheduledExecutor().scheduleAtFixedRate(() -> {
             try {
                 for (Ledger.StuckTx tx : ledger.findPreparedOutOlderThan(30)) {
@@ -70,13 +76,68 @@ public class NodeApp {
         }, 15, 15, java.util.concurrent.TimeUnit.SECONDS);
 
         HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
-        server.setExecutor(Executors.newCachedThreadPool()); // ← КРИТИЧНО
+        server.setExecutor(Executors.newCachedThreadPool()); // КРИТИЧНО для избежания дедлока
 
+        // ── Node identity ──────────────────────────────────────────
         server.createContext("/.well-known/sporelink-node", ex -> respond(ex, 200,
                 "{\"node_id\":\"" + nodeId
               + "\",\"public_key\":\"ed25519:" + key.publicKeyBase64()
               + "\",\"endpoint\":\"" + selfUrl + "\"}"));
 
+        // ── Policy endpoints ───────────────────────────────────────
+        server.createContext("/policy", ex -> {
+            if ("GET".equals(ex.getRequestMethod())) {
+                respond(ex, 200, "{\"min_reputation_to_join\":" + minReputationToJoin + "}");
+            } else if ("POST".equals(ex.getRequestMethod())) {
+                try {
+                    JsonNode b = MAPPER.readTree(ex.getRequestBody());
+                    if (b.has("min_reputation_to_join")) {
+                        minReputationToJoin = b.get("min_reputation_to_join").asInt();
+                        System.out.println("[policy] min_reputation_to_join = " + minReputationToJoin);
+                    }
+                    respond(ex, 200, "{\"status\":\"updated\"}");
+                } catch (Exception e) {
+                    respond(ex, 400, "{\"error\":\"bad json\"}");
+                }
+            } else {
+                respond(ex, 405, "{\"error\":\"GET or POST only\"}");
+            }
+        });
+
+        // ── Player Authentication (JWT) ────────────────────────────
+        server.createContext("/auth/player", ex -> {
+            if (!isPost(ex)) {
+                respond(ex, 405, "{\"error\":\"POST only\"}");
+                return;
+            }
+            try {
+                JsonNode b = MAPPER.readTree(ex.getRequestBody());
+                String jwt = b.get("jwt").asText();
+
+                JsonNode payload = verifyJwtWithHub(jwt, hubUrl);
+                if (payload == null) {
+                    respond(ex, 401, "{\"error\":\"invalid jwt or hub unreachable\"}");
+                    return;
+                }
+
+                int rep = payload.has("reputation") ? payload.get("reputation").asInt() : 0;
+                if (rep < minReputationToJoin) {
+                    respond(ex, 403, "{\"error\":\"reputation too low\","
+                            + "\"reputation\":" + rep
+                            + ",\"required\":" + minReputationToJoin + "}");
+                    return;
+                }
+
+                respond(ex, 200, "{\"status\":\"allowed\","
+                        + "\"player_id\":\"" + payload.get("sub").asText() + "\","
+                        + "\"name\":\"" + payload.get("name").asText() + "\","
+                        + "\"reputation\":" + rep + "}");
+            } catch (Exception e) {
+                respond(ex, 500, err(e));
+            }
+        });
+
+        // ── Local ledger ───────────────────────────────────────────
         server.createContext("/balance/", ex -> {
             try {
                 String id = pathSuffix(ex, "/balance/");
@@ -96,7 +157,7 @@ public class NodeApp {
             } catch (Exception e) { respond(ex, 500, err(e)); }
         });
 
-        // ── Signed 2PC endpoints ───────────────────────────────────
+        // ── 2PC: receiver side (signed) ────────────────────────────
         server.createContext("/tx/prepare", ex -> {
             if (!isPost(ex)) { respond(ex, 405, "{\"error\":\"POST only\"}"); return; }
             byte[] body;
@@ -148,6 +209,7 @@ public class NodeApp {
             } catch (Exception e) { respond(ex, 500, err(e)); }
         });
 
+        // ── 2PC: sender orchestration ──────────────────────────────
         server.createContext("/transfer", ex -> {
             if (!isPost(ex)) { respond(ex, 405, "{\"error\":\"POST only\"}"); return; }
             try {
@@ -184,7 +246,6 @@ public class NodeApp {
                     return;
                 }
 
-                // ── Commit (with from_node in body for peer key discovery) ──
                 String commitBody = "{\"tx_id\":\"" + txId
                         + "\",\"from_node\":\"" + selfUrl + "\"}";
                 boolean commitOk = false;
@@ -211,6 +272,41 @@ public class NodeApp {
 
         server.start();
         System.out.println("Listening on " + selfUrl);
+    }
+
+    // ── Verify JWT using Hub's public key ──────────────────────────
+    private static JsonNode verifyJwtWithHub(String jwt, String hubUrl) {
+        try {
+            String[] parts = jwt.split("\\.");
+            if (parts.length != 3) return null;
+
+            // 1. Fetch Hub's well-known
+            String wkBody = HTTP.send(
+                    HttpRequest.newBuilder(URI.create(hubUrl + "/.well-known/mc-federation"))
+                            .GET().build(),
+                    HttpResponse.BodyHandlers.ofString()).body();
+            JsonNode wk = MAPPER.readTree(wkBody);
+            String pkB64 = wk.at("/public_keys/server_signing_key").asText().replace("ed25519:", "");
+            Ed25519PublicKeyParameters pub = new Ed25519PublicKeyParameters(Base64.getDecoder().decode(pkB64), 0);
+
+            // 2. Verify signature
+            String signingInput = parts[0] + "." + parts[1];
+            byte[] sig = Base64.getUrlDecoder().decode(parts[2]);
+
+            Ed25519Signer verifier = new Ed25519Signer();
+            verifier.init(false, pub);
+            byte[] input = signingInput.getBytes(StandardCharsets.UTF_8);
+            verifier.update(input, 0, input.length);
+            if (!verifier.verifySignature(sig)) return null;
+
+            // 3. Check exp
+            JsonNode payload = MAPPER.readTree(Base64.getUrlDecoder().decode(parts[1]));
+            if (payload.get("exp").asLong() < System.currentTimeMillis() / 1000) return null;
+
+            return payload;
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     // ── Signed POST ────────────────────────────────────────────────
