@@ -42,6 +42,11 @@ public class NodeApp {
         String nodeId = args[2];
         String hubUrl = args[3].replaceAll("/+$", "");
         String selfUrl = "http://localhost:" + port;
+        String nodeSecret = System.getenv("NODE_SECRET");
+        if (nodeSecret == null) {
+            System.err.println("FATAL: NODE_SECRET env variable is not set!");
+            System.exit(1);
+        }
 
         NodeKey key = NodeKey.loadOrCreate(dataDir + "/node-key.txt");
         Ledger ledger = new Ledger(dataDir + "/ledger.db");
@@ -148,12 +153,38 @@ public class NodeApp {
 
         server.createContext("/credit/", ex -> {
             if (!isPost(ex)) { respond(ex, 405, "{\"error\":\"POST only\"}"); return; }
+            
+            // 1. Проверяем, что пришел JWT
+            String authHeader = ex.getRequestHeaders().getFirst("Authorization");
+            if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+                respond(ex, 401, "{\"error\":\"Missing token\"}"); return;
+            }
+            
+            // 2. Проверяем валидность JWT через Hub
+            String jwt = authHeader.substring(7);
+            JsonNode payload = verifyJwtWithHub(jwt, hubUrl);
+            if (payload == null) {
+                respond(ex, 401, "{\"error\":\"Invalid token\"}"); return;
+            }
+
+            // 3. Проверяем, что у пользователя есть роль admin или ceo
+            boolean isAdmin = false;
+            if (payload.has("roles")) {
+                for (JsonNode role : payload.get("roles")) {
+                    String r = role.asText();
+                    if (r.equals("admin") || r.equals("ceo")) { isAdmin = true; break; }
+                }
+            }
+            if (!isAdmin) {
+                respond(ex, 403, "{\"error\":\"Access denied. Admins only.\"}"); return;
+            }
+
+            // 4. Выполняем начисление
             try {
                 String id = pathSuffix(ex, "/credit/");
                 JsonNode b = MAPPER.readTree(ex.getRequestBody());
                 ledger.credit(id, b.get("amount").asLong());
-                respond(ex, 200, "{\"player_id\":\"" + id + "\",\"balance\":"
-                        + ledger.balance(id) + "}");
+                respond(ex, 200, "{\"player_id\":\"" + id + "\",\"balance\":" + ledger.balance(id) + "}");
             } catch (Exception e) { respond(ex, 500, err(e)); }
         });
 
@@ -212,6 +243,23 @@ public class NodeApp {
         // ── 2PC: sender orchestration ──────────────────────────────
         server.createContext("/transfer", ex -> {
             if (!isPost(ex)) { respond(ex, 405, "{\"error\":\"POST only\"}"); return; }
+            
+            String secretHeader = ex.getRequestHeaders().getFirst("X-Node-Secret");
+            String authHeader = ex.getRequestHeaders().getFirst("Authorization");
+            
+            boolean isAuthorized = false;
+            
+            if (secretHeader != null && secretHeader.equals(nodeSecret)) {
+                isAuthorized = true; // Запрос от плагина Minecraft
+            } else if (authHeader != null && authHeader.startsWith("Bearer ")) {
+                JsonNode payload = verifyJwtWithHub(authHeader.substring(7), hubUrl);
+                if (payload != null) isAuthorized = true; // Запрос от панели
+            }
+            
+            if (!isAuthorized) {
+                respond(ex, 401, "{\"error\":\"Unauthorized\"}"); return;
+            }
+
             try {
                 // 1. Парсим тело запроса
                 JsonNode b = MAPPER.readTree(ex.getRequestBody());
@@ -220,6 +268,22 @@ public class NodeApp {
                 String to     = b.get("to").asText();
                 long   amount = b.get("amount").asLong();
                 String txId   = UUID.randomUUID().toString();
+
+                // Проверка: существует ли получатель в Hub
+                try {
+                    HttpRequest checkReq = HttpRequest.newBuilder(URI.create(hubUrl + "/api/users/" + to + "/exists")).GET().build();
+                    HttpResponse<String> checkRes = HTTP.send(checkReq, HttpResponse.BodyHandlers.ofString());
+                    if (checkRes.statusCode() == 200) {
+                        JsonNode checkJson = MAPPER.readTree(checkRes.body());
+                        if (!checkJson.get("exists").asBoolean()) {
+                            respond(ex, 400, "{\"error\":\"Player does not exist\"}");
+                            return;
+                        }
+                    }
+                } catch (Exception e) {
+                    respond(ex, 502, "{\"error\":\"Cannot verify player existence\"}");
+                    return;
+                }
 
                 // 2. НОВЫЙ БЛОК: Локальный перевод (если оба игрока на этой ноде)
                 if (toNode.equals(selfUrl)) {
@@ -281,6 +345,15 @@ public class NodeApp {
                 respond(ex, 200, "{\"status\":\"committed\",\"tx_id\":\"" + txId + "\"}");
             } catch (Exception e) { 
                 respond(ex, 500, err(e)); 
+            }
+        });
+
+        // Глобальный обработчик для OPTIONS запросов (CORS preflight)
+        server.createContext("/", ex -> {
+            if ("OPTIONS".equals(ex.getRequestMethod())) {
+                respond(ex, 200, "{}");
+            } else {
+                respond(ex, 404, "{\"error\":\"Not found\"}");
             }
         });
 
@@ -409,6 +482,10 @@ public class NodeApp {
                 .replace("\n", " ").replace("\r", "");
     }
     private static void respond(HttpExchange ex, int status, String body) throws IOException {
+        ex.getResponseHeaders().add("Access-Control-Allow-Origin", "*");
+        ex.getResponseHeaders().add("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+        ex.getResponseHeaders().add("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Node-Secret");
+        
         byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
         ex.getResponseHeaders().add("Content-Type", "application/json");
         ex.sendResponseHeaders(status, bytes.length);
