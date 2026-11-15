@@ -154,32 +154,28 @@ public class NodeApp {
         server.createContext("/credit/", ex -> {
             if (!isPost(ex)) { respond(ex, 405, "{\"error\":\"POST only\"}"); return; }
             
-            // 1. Проверяем, что пришел JWT
+            // Проверяем либо секретный ключ (от Hub), либо JWT (от панели)
+            String secretHeader = ex.getRequestHeaders().getFirst("X-Node-Secret");
             String authHeader = ex.getRequestHeaders().getFirst("Authorization");
-            if (authHeader == null || !authHeader.startsWith("Bearer ")) {
-                respond(ex, 401, "{\"error\":\"Missing token\"}"); return;
-            }
             
-            // 2. Проверяем валидность JWT через Hub
-            String jwt = authHeader.substring(7);
-            JsonNode payload = verifyJwtWithHub(jwt, hubUrl);
-            if (payload == null) {
-                respond(ex, 401, "{\"error\":\"Invalid token\"}"); return;
-            }
-
-            // 3. Проверяем, что у пользователя есть роль admin или ceo
-            boolean isAdmin = false;
-            if (payload.has("roles")) {
-                for (JsonNode role : payload.get("roles")) {
-                    String r = role.asText();
-                    if (r.equals("admin") || r.equals("ceo")) { isAdmin = true; break; }
+            boolean isAuthorized = false;
+            
+            if (secretHeader != null && secretHeader.equals(nodeSecret)) {
+                isAuthorized = true;
+            } else if (authHeader != null && authHeader.startsWith("Bearer ")) {
+                JsonNode payload = verifyJwtWithHub(authHeader.substring(7), hubUrl);
+                if (payload != null) {
+                    for (JsonNode role : payload.get("roles")) {
+                        String r = role.asText();
+                        if (r.equals("admin") || r.equals("ceo")) { isAuthorized = true; break; }
+                    }
                 }
             }
-            if (!isAdmin) {
-                respond(ex, 403, "{\"error\":\"Access denied. Admins only.\"}"); return;
+
+            if (!isAuthorized) {
+                respond(ex, 401, "{\"error\":\"Unauthorized\"}"); return;
             }
 
-            // 4. Выполняем начисление
             try {
                 String id = pathSuffix(ex, "/credit/");
                 JsonNode b = MAPPER.readTree(ex.getRequestBody());
